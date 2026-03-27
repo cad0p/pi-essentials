@@ -1,0 +1,26 @@
+{
+  "name": "pi-essentials",
+  "version": "0.1.0",
+  "description": "Essential extensions for pi — auto session naming, compact header, clipboard images, image pruning, markdown viewer, screenshots, and subagents.",
+  "keywords": ["pi-package", "extensions"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/samfoy/pi-essentials"
+  },
+  "pi": {
+    "extensions": [
+      "./src/auto-session-name.ts",
+      "./src/compact-header.ts",
+      "./src/clipboard-image.ts",
+      "./src/image-context-pruner.ts",
+      "./src/markdown-viewer.ts",
+      "./src/screenshot.ts",
+      "./src/subagent.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": ">=0.57.0",
+    "@mariozechner/pi-tui": ">=0.57.0"
+  }
+}
