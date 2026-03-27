@@ -1,8 +1,11 @@
 {
-  "name": "pi-essentials",
+  "name": "@samfp/pi-essentials",
   "version": "0.1.0",
   "description": "Essential extensions for pi — auto session naming, compact header, clipboard images, image pruning, markdown viewer, screenshots, and subagents.",
-  "keywords": ["pi-package", "extensions"],
+  "keywords": [
+    "pi-package",
+    "extensions"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",
