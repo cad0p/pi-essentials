@@ -6,14 +6,14 @@
  *
  * Two modes:
  *   - background (default): `pi -p` in a detached process. Fast, no TUI.
- *   - interactive: Full pi in a tmux session. User can `tmux attach -t <id>`.
+ *   - interactive: Full pi in a tmux window. User can switch to it to watch or steer.
  *     The subagent writes its result file; a watcher detects completion and injects.
  */
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { spawn, execSync, execFileSync, type ChildProcess } from "node:child_process";
-import { writeFile, readFile, unlink, access, chmod } from "node:fs/promises";
-import { join, dirname } from "node:path";
+import { spawn, execFileSync } from "node:child_process";
+import { writeFile, readFile, unlink, access } from "node:fs/promises";
+import { join } from "node:path";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 
@@ -160,18 +160,42 @@ export default function (pi: ExtensionAPI) {
 
   /**
    * Spawn in interactive mode: full pi in a tmux session.
-   * User can `tmux attach -t subagent-<id>` to watch or steer.
+   * User can switch to the tmux window to watch or steer.
    */
   function spawnInteractive(id: string, task: string, cwd: string): SubagentEntry {
     const tmuxName = `subagent-${id}`;
     const resultFile = `/tmp/subagent-${id}-result.md`;
     const promptFile = `/tmp/subagent-${id}-prompt.md`;
 
-    // Create tmux session running pi
-    execSync(
-      `tmux new-session -d -s ${tmuxName} -c ${JSON.stringify(cwd)} 'pi'`,
-      { stdio: "ignore" }
-    );
+    // Detect the parent tmux session. Creating a new window inside it
+    // avoids iTerm2's tmux -CC capturing a new session (which redirects
+    // the pi pane and breaks prompt delivery).
+    let parentSession = "";
+    try {
+      parentSession = execFileSync("tmux", ["display-message", "-p", "#{session_name}"],
+        { encoding: "utf8" }).trim();
+    } catch { /* not in tmux */ }
+
+    let pasteTarget: string;
+
+    if (parentSession) {
+      // New window in the current session — shows as a tab in iTerm2
+      pasteTarget = `${parentSession}:${tmuxName}`;
+      execFileSync("tmux", [
+        "new-window", "-t", parentSession, "-n", tmuxName, "-c", cwd, "pi",
+      ], { stdio: "ignore" });
+    } else {
+      // No parent session — fall back to detached session
+      pasteTarget = tmuxName;
+      execFileSync("tmux", [
+        "new-session", "-d", "-s", tmuxName, "-c", cwd, "pi",
+      ], { stdio: "ignore" });
+      // Detached sessions default to 80x24; resize so pi's TUI doesn't crash
+      try {
+        execFileSync("tmux", ["resize-window", "-t", tmuxName, "-x", "200", "-y", "50"],
+          { stdio: "ignore" });
+      } catch { /* session may have died */ }
+    }
 
     // Build the prompt — instruct pi to write results and exit when done
     const framedTask = `${task}
@@ -188,10 +212,10 @@ When you have completed the task, do these two things:
         writeFileSync(promptFile, framedTask);
         const bufferName = `${tmuxName}-prompt`;
         execFileSync("tmux", ["load-buffer", "-b", bufferName, promptFile], { stdio: "ignore" });
-        execFileSync("tmux", ["paste-buffer", "-dp", "-b", bufferName, "-t", tmuxName], { stdio: "ignore" });
-        execFileSync("tmux", ["send-keys", "-t", tmuxName, "Enter"], { stdio: "ignore" });
+        execFileSync("tmux", ["paste-buffer", "-dp", "-b", bufferName, "-t", pasteTarget], { stdio: "ignore" });
+        execFileSync("tmux", ["send-keys", "-t", pasteTarget, "Enter"], { stdio: "ignore" });
       } catch {
-        // tmux session may have died
+        // tmux window/session may have died
       }
     }, 2000);
 
@@ -200,12 +224,12 @@ When you have completed the task, do these two things:
       startTime: Date.now(),
       task,
       resultFile,
-      tmuxSession: tmuxName,
+      tmuxSession: pasteTarget,
     };
 
-    // Poll for completion: result file exists OR tmux session is gone
+    // Poll for completion: result file exists OR tmux target is gone
     entry.watcher = setInterval(async () => {
-      const sessionAlive = isSessionAlive(tmuxName);
+      const alive = isTargetAlive(pasteTarget);
       let resultExists = false;
       try {
         await access(resultFile);
@@ -213,18 +237,15 @@ When you have completed the task, do these two things:
       } catch {}
 
       if (resultExists) {
-        // Result written — give a moment for pi to finish, then inject
-        // If session is still alive, wait a bit for it to wrap up
-        if (sessionAlive) {
-          // Check again in next poll — pi might still be writing
-          // But if result file exists, it's likely done
+        if (alive) {
+          // Result written but pi may still be wrapping up — short grace period
           setTimeout(() => injectResult(id, entry), 3000);
           if (entry.watcher) clearInterval(entry.watcher);
         } else {
           injectResult(id, entry);
         }
-      } else if (!sessionAlive) {
-        // Session died without writing result — inject failure
+      } else if (!alive) {
+        // Target died without writing result
         injectResult(id, entry);
       }
     }, 5000);
@@ -232,9 +253,9 @@ When you have completed the task, do these two things:
     return entry;
   }
 
-  function isSessionAlive(name: string): boolean {
+  function isTargetAlive(target: string): boolean {
     try {
-      execSync(`tmux has-session -t ${name} 2>/dev/null`, { stdio: "ignore" });
+      execFileSync("tmux", ["display-message", "-t", target, "-p", ""], { stdio: "ignore" });
       return true;
     } catch {
       return false;
@@ -255,7 +276,7 @@ When you have completed the task, do these two things:
       "Use short descriptive IDs like 'cr-review', 'coverage', 'pipeline-check'",
       "Max 3-4 concurrent subagents to avoid rate limits",
       "Subagent results arrive as messages — you'll get a turn to incorporate them",
-      "Start a background pi session in tmux that the user can attach to and steer, with results still auto-injecting when done",
+      "Interactive mode spawns pi in a tmux window the user can switch to and steer, with results still auto-injecting when done",
     ],
     parameters: Type.Object({
       id: Type.String({
@@ -274,7 +295,7 @@ When you have completed the task, do these two things:
       interactive: Type.Optional(
         Type.Boolean({
           description:
-            "If true, spawns a full pi session in tmux that the user can attach to (tmux attach -t subagent-<id>). Default: false (background pi -p).",
+            "If true, spawns a full pi session in a tmux window the user can switch to. Default: false (background pi -p).",
         })
       ),
     }),
@@ -299,7 +320,7 @@ When you have completed the task, do these two things:
       active.set(id, entry);
 
       const modeInfo = interactive
-        ? `Interactive tmux session 'subagent-${id}'. User can attach:\n  tmux attach -t subagent-${id}`
+        ? `Interactive pi in tmux window 'subagent-${id}'. Switch to it:\n  tmux select-window -t ${entry.tmuxSession}`
         : `Background process (PID: ${entry.pid})`;
 
       return {
@@ -341,7 +362,7 @@ When you have completed the task, do these two things:
         const mode = entry.mode === "interactive" ? "tmux" : "bg";
         const attach =
           entry.mode === "interactive"
-            ? ` — \`tmux attach -t ${entry.tmuxSession}\``
+            ? ` — \`tmux select-window -t ${entry.tmuxSession}\``
             : "";
         return `- **${id}** [${mode}] — running for ${elapsed}s${attach}`;
       });
