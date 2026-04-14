@@ -11,7 +11,7 @@
  */
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { spawn, execSync, type ChildProcess } from "node:child_process";
+import { spawn, execSync, execFileSync, type ChildProcess } from "node:child_process";
 import { writeFile, readFile, unlink, access, chmod } from "node:fs/promises";
 import { join, dirname } from "node:path";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
@@ -180,14 +180,16 @@ When you have completed the task, do these two things:
 1. Use the write tool to save your complete findings/summary to ${resultFile}
 2. Then say "SUBAGENT COMPLETE" so I know you're done.`;
 
-    // Small delay to let pi initialize, then send the prompt
+    // Small delay to let pi initialize, then paste the prompt as one block.
+    // tmux send-keys treats \n as Enter keypresses, splitting multi-line
+    // prompts into separate inputs. Use load-buffer + paste-buffer instead.
     setTimeout(() => {
       try {
-        // Write prompt to file to avoid shell escaping issues, then paste it
-        const escaped = framedTask.replace(/'/g, "'\\''");
-        execSync(`tmux send-keys -t ${tmuxName} '${escaped}' Enter`, {
-          stdio: "ignore",
-        });
+        writeFileSync(promptFile, framedTask);
+        const bufferName = `${tmuxName}-prompt`;
+        execFileSync("tmux", ["load-buffer", "-b", bufferName, promptFile], { stdio: "ignore" });
+        execFileSync("tmux", ["paste-buffer", "-dp", "-b", bufferName, "-t", tmuxName], { stdio: "ignore" });
+        execFileSync("tmux", ["send-keys", "-t", tmuxName, "Enter"], { stdio: "ignore" });
       } catch {
         // tmux session may have died
       }
