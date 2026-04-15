@@ -18,6 +18,7 @@ pi install npm:pi-essentials
 | **Image Context Pruner** | Strips images from older messages to save context tokens |
 | **Markdown Viewer** | Rendered markdown preview on Ctrl+O for `.md` files, plus `/mdview` and `/mermaid` commands |
 | **Screenshot** | `/ss` command — grab clipboard image or send a file to the agent. Requires kitty terminal + `kitten` binary |
+| **Context Pruner** | `context_prune` tool — lets the agent replace bulky search results with short summaries to free context space |
 | **Subagent** | `subagent` and `subagent_status` tools for spawning background pi instances whose results auto-inject back |
 
 ## Requirements
