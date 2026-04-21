@@ -6,6 +6,7 @@
  * subagents spawned with an inherited `TMUX_PANE` don't rename the parent.
  */
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { basename } from "node:path";
 
 export default function (pi: ExtensionAPI) {
   let titled = false;
@@ -29,7 +30,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function setTmuxTitle(label: string, cwd: string, ctx: { ui: { setTitle: (t: string) => void } }) {
-    const folder = cwd.split("/").pop() ?? cwd;
+    const folder = basename(cwd) || cwd;
     const paneTitle = `π - ${folder} - ${label}`;
     ctx.ui.setTitle(paneTitle);
     const target = await resolveWindowId();
