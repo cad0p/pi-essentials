@@ -50,7 +50,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("input", async (event, ctx) => {
     if (!ctx.hasUI) return { action: "continue" as const };
-    if (!event.text.trim()) return { action: "continue" as const };
+    if (!event.text?.trim()) return { action: "continue" as const };
     if (!titled && !pi.getSessionName()) {
       const label = truncate(event.text, 40);
       await setTmuxTitle(label, ctx.cwd, ctx);
