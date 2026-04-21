@@ -27,20 +27,28 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		// Strip images from all user messages except the most recent one with images
-		for (let i = 0; i < messages.length; i++) {
-			if (i === lastUserWithImageIdx) continue;
+		const result = messages.map((msg, i) => {
+			if (i === lastUserWithImageIdx) return msg;
 
-			const msg = messages[i];
 			if (msg.role === "user" && Array.isArray(msg.content)) {
-				msg.content = msg.content.map((block: any) => {
-					if (block.type === "image" || block.type === "image_url") {
-						return { type: "text", text: "[image — already processed in earlier turn]" };
-					}
-					return block;
-				});
+				const hasImage = msg.content.some(
+					(block: any) => block.type === "image" || block.type === "image_url"
+				);
+				if (hasImage) {
+					return {
+						...msg,
+						content: msg.content.map((block: any) => {
+							if (block.type === "image" || block.type === "image_url") {
+								return { type: "text", text: "[image — already processed in earlier turn]" };
+							}
+							return block;
+						}),
+					};
+				}
 			}
-		}
+			return msg;
+		});
 
-		return { messages };
+		return { messages: result };
 	});
 }
