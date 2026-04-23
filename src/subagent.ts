@@ -1,222 +1,335 @@
 /**
- * Subagent Extension
- *
- * Provides `subagent` and `subagent_status` tools for spawning background pi
- * instances whose results auto-inject back into the parent session.
+ * Subagent Extension — fire-and-forget with streaming progress.
  *
  * Two modes:
- *   - background (default): `pi -p` in a detached process. Fast, no TUI.
- *   - interactive: Full pi in a tmux window. User can switch to it to watch or steer.
- *     The subagent writes its result file; a watcher detects completion and injects.
+ *   - background (default): Spawns `pi --mode json -p --no-session`.
+ *     Returns immediately. Parses JSON events in background for live
+ *     widget updates. Injects result via sendMessage when done.
+ *   - interactive: Full pi in a tmux window. Same as before.
  */
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { spawn, execFileSync } from "node:child_process";
 import { writeFile, readFile, unlink, access } from "node:fs/promises";
-import { join } from "node:path";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
+import type { Message } from "@mariozechner/pi-ai";
 
-/**
- * Ensure the subagent runner script exists in ~/.pi/agent/bin/.
- * Creates it on first use so the extension is self-contained.
- */
-function ensureRunner(): string {
-  const binDir = join(homedir(), ".pi", "agent", "bin");
-  const runner = join(binDir, "subagent-run.sh");
-  if (existsSync(runner)) return runner;
+// ── Types ──────────────────────────────────────────────────────────────
 
-  mkdirSync(binDir, { recursive: true });
-  writeFileSync(runner, RUNNER_SCRIPT, { mode: 0o755 });
-  return runner;
+interface Usage {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  cost: number;
+  turns: number;
 }
 
-const RUNNER_SCRIPT = `#!/usr/bin/env bash
-# subagent-run.sh — Run a pi subagent non-interactively, capture results.
-set -euo pipefail
-
-ID="\${1:?Usage: subagent-run.sh <id> [working-dir]}"
-WORKDIR="\${2:-$(pwd)}"
-
-PROMPT_FILE="/tmp/subagent-\${ID}-prompt.md"
-RESULT_FILE="/tmp/subagent-\${ID}-result.md"
-ERR_LOG="/tmp/subagent-\${ID}-err.log"
-
-if [[ ! -f "$PROMPT_FILE" ]]; then
-  echo "ERROR: Prompt file not found: $PROMPT_FILE" >&2
-  exit 1
-fi
-
-cd "$WORKDIR"
-
-TASK=$(cat "$PROMPT_FILE")
-
-FULL_PROMPT="You are a subagent spawned by a parent agent to complete a specific task.
-Complete the task below thoroughly, then provide a clear SUMMARY section at the end.
-
-## Task
-\${TASK}
-
-## Instructions
-- Use all available tools (read, bash, edit, etc.) as needed
-- Be thorough but focused on the task
-- End your response with a section starting with '## Summary' containing:
-  - What you found / what you did
-  - Key results, data, or conclusions
-  - Any issues or follow-ups for the parent agent"
-
-echo "$FULL_PROMPT" | pi -p --no-session > "$RESULT_FILE" 2>"$ERR_LOG"
-
-EXIT_CODE=$?
-
-echo "" >> "$RESULT_FILE"
-echo "---" >> "$RESULT_FILE"
-echo "_Subagent \${ID} completed at $(date -u +%Y-%m-%dT%H:%M:%SZ) (exit: \${EXIT_CODE})_" >> "$RESULT_FILE"
-
-exit $EXIT_CODE
-`;
-
-interface SubagentEntry {
+interface TrackedRun {
+  id: string;
+  task: string;
   mode: "background" | "interactive";
   startTime: number;
-  task: string;
-  resultFile: string;
-  pid?: number;
+  finishedAt?: number;
+  exitCode?: number;
+  // Background-only streaming state
+  messages: Message[];
+  usage: Usage;
+  model?: string;
+  stopReason?: string;
+  errorMessage?: string;
+  lastToolCall?: string;
+  // Interactive-only
   tmuxSession?: string;
+  resultFile?: string;
   watcher?: ReturnType<typeof setInterval>;
 }
 
+// ── Helpers ────────────────────────────────────────────────────────────
+
+function emptyUsage(): Usage {
+  return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
+}
+
+function formatTokens(n: number): string {
+  if (n < 1000) return String(n);
+  if (n < 10000) return `${(n / 1000).toFixed(1)}k`;
+  if (n < 1_000_000) return `${Math.round(n / 1000)}k`;
+  return `${(n / 1_000_000).toFixed(1)}M`;
+}
+
+function formatUsage(u: Usage, model?: string): string {
+  const p: string[] = [];
+  if (u.turns) p.push(`${u.turns}t`);
+  if (u.input) p.push(`↑${formatTokens(u.input)}`);
+  if (u.output) p.push(`↓${formatTokens(u.output)}`);
+  if (u.cost) p.push(`$${u.cost.toFixed(3)}`);
+  if (model) p.push(model);
+  return p.join(" ");
+}
+
+function getFinalText(messages: Message[]): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (msg.role === "assistant") {
+      for (const part of msg.content) {
+        if (part.type === "text") return part.text;
+      }
+    }
+  }
+  return "";
+}
+
+function shortenPath(p: string): string {
+  const home = homedir();
+  return p.startsWith(home) ? `~${p.slice(home.length)}` : p;
+}
+
+function formatToolCallShort(name: string, args: Record<string, any>): string {
+  switch (name) {
+    case "bash": {
+      const cmd = (args.command as string) || "...";
+      return `$ ${cmd.length > 50 ? cmd.slice(0, 50) + "…" : cmd}`;
+    }
+    case "read":
+      return `read ${shortenPath((args.file_path || args.path || "...") as string)}`;
+    case "write":
+      return `write ${shortenPath((args.file_path || args.path || "...") as string)}`;
+    case "edit":
+      return `edit ${shortenPath((args.file_path || args.path || "...") as string)}`;
+    default:
+      return name;
+  }
+}
+
+function getPiInvocation(args: string[]): { command: string; args: string[] } {
+  const currentScript = process.argv[1];
+  const isBunVirtual = currentScript?.startsWith("/$bunfs/root/");
+  if (currentScript && !isBunVirtual && existsSync(currentScript)) {
+    return { command: process.execPath, args: [currentScript, ...args] };
+  }
+  const execName = (process.execPath.split("/").pop() || "").toLowerCase();
+  if (!/^(node|bun)(\.exe)?$/.test(execName)) {
+    return { command: process.execPath, args };
+  }
+  return { command: "pi", args };
+}
+
+function elapsedStr(start: number, end?: number): string {
+  const s = ((end || Date.now()) - start) / 1000;
+  return s < 60 ? `${s.toFixed(0)}s` : `${(s / 60).toFixed(1)}m`;
+}
+
+// ── Extension ──────────────────────────────────────────────────────────
+
 export default function (pi: ExtensionAPI) {
-  const active = new Map<string, SubagentEntry>();
+  const active = new Map<string, TrackedRun>();
+  let widgetCtx: any = null; // stash ctx for widget updates
 
-  pi.on("session_start", async () => {
-    // Clear stale entries on reload (processes may still run, but we lose tracking)
-    for (const [, entry] of active) {
-      if (entry.watcher) clearInterval(entry.watcher);
-    }
-    active.clear();
-  });
+  // ── Widget: live status of all running subagents ──
 
-  // Clean up watchers on shutdown
-  pi.on("session_shutdown", async () => {
-    for (const [, entry] of active) {
-      if (entry.watcher) clearInterval(entry.watcher);
-    }
-  });
-
-  /**
-   * Inject the result of a completed subagent back into the parent session.
-   */
-  async function injectResult(id: string, entry: SubagentEntry, exitCode?: number) {
-    const elapsed = Math.round((Date.now() - entry.startTime) / 1000);
-    if (entry.watcher) clearInterval(entry.watcher);
-    active.delete(id);
-
-    let content: string;
-    try {
-      const result = await readFile(entry.resultFile, "utf8");
-      content = `## Subagent \`${id}\` completed (${elapsed}s)\n\n${result}`;
-    } catch {
-      let errMsg = "";
-      try {
-        errMsg = await readFile(`/tmp/subagent-${id}-err.log`, "utf8");
-      } catch {}
-      const exitInfo = exitCode !== undefined ? `, exit: ${exitCode}` : "";
-      content = `## Subagent \`${id}\` failed (${elapsed}s${exitInfo})\n\n${errMsg || "No output. Check /tmp/subagent-" + id + "-err.log"}`;
+  function updateWidget() {
+    if (!widgetCtx) return;
+    const running = [...active.values()].filter((r) => r.exitCode === undefined);
+    if (running.length === 0) {
+      widgetCtx.ui.setWidget("subagent-status", undefined);
+      return;
     }
 
-    pi.sendMessage(
-      { customType: "subagent-result", content, display: true },
-      { triggerTurn: true, deliverAs: "followUp" }
-    );
-
-    // Clean up prompt file
-    unlink(`/tmp/subagent-${id}-prompt.md`).catch(() => {});
+    widgetCtx.ui.setWidget("subagent-status", (_tui: any, theme: any) => {
+      const lines = running.map((r) => {
+        const elapsed = elapsedStr(r.startTime);
+        const icon = r.mode === "interactive" ? "🖥" : "⏳";
+        const activity = r.lastToolCall
+          ? theme.fg("dim", ` → ${r.lastToolCall}`)
+          : theme.fg("dim", " starting…");
+        const usage = r.usage.turns > 0 ? theme.fg("muted", ` [${formatUsage(r.usage)}]`) : "";
+        return `${icon} ${theme.fg("accent", r.id)} ${theme.fg("dim", elapsed)}${activity}${usage}`;
+      });
+      return new Text(lines.join("\n"), 0, 0);
+    });
   }
 
-  /**
-   * Spawn in background mode: pi -p, detached process.
-   */
-  function spawnBackground(id: string, task: string, cwd: string): SubagentEntry {
-    const resultFile = `/tmp/subagent-${id}-result.md`;
-    const runner = ensureRunner();
-    const proc = spawn(runner, [id, cwd], {
-      stdio: ["ignore", "ignore", "ignore"],
-      detached: true,
-    });
+  // ── Background mode: fire-and-forget with JSON streaming ──
 
-    const entry: SubagentEntry = {
+  function spawnBackground(
+    id: string,
+    task: string,
+    cwd: string,
+  ): TrackedRun {
+    const run: TrackedRun = {
+      id,
+      task,
       mode: "background",
       startTime: Date.now(),
-      task,
-      resultFile,
-      pid: proc.pid,
+      messages: [],
+      usage: emptyUsage(),
     };
 
-    proc.on("close", (code) => injectResult(id, entry, code ?? undefined));
+    const piArgs: string[] = ["--mode", "json", "-p", "--no-session", task];
+    const invocation = getPiInvocation(piArgs);
+
+    const proc = spawn(invocation.command, invocation.args, {
+      cwd,
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let buffer = "";
+    let stderr = "";
+
+    const processLine = (line: string) => {
+      if (!line.trim()) return;
+      let event: any;
+      try { event = JSON.parse(line); } catch { return; }
+
+      if (event.type === "message_end" && event.message) {
+        const msg = event.message as Message;
+        run.messages.push(msg);
+        if (msg.role === "assistant") {
+          run.usage.turns++;
+          const u = msg.usage;
+          if (u) {
+            run.usage.input += u.input || 0;
+            run.usage.output += u.output || 0;
+            run.usage.cacheRead += u.cacheRead || 0;
+            run.usage.cacheWrite += u.cacheWrite || 0;
+            run.usage.cost += u.cost?.total || 0;
+          }
+          if (!run.model && msg.model) run.model = msg.model;
+          if (msg.stopReason) run.stopReason = msg.stopReason;
+          if (msg.errorMessage) run.errorMessage = msg.errorMessage;
+
+          // Track latest tool call for widget display
+          for (const part of msg.content) {
+            if (part.type === "toolCall") {
+              run.lastToolCall = formatToolCallShort(part.name, part.arguments);
+            }
+          }
+        }
+        updateWidget();
+      }
+
+      if (event.type === "tool_result_end" && event.message) {
+        run.messages.push(event.message as Message);
+        updateWidget();
+      }
+    };
+
+    proc.stdout.on("data", (data: Buffer) => {
+      buffer += data.toString();
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+      for (const line of lines) processLine(line);
+    });
+
+    proc.stderr.on("data", (data: Buffer) => {
+      stderr += data.toString();
+    });
+
+    proc.on("close", (code) => {
+      if (buffer.trim()) processLine(buffer);
+      run.exitCode = code ?? 0;
+      run.finishedAt = Date.now();
+
+      const elapsed = elapsedStr(run.startTime, run.finishedAt);
+      const output = getFinalText(run.messages);
+      const isError = run.exitCode !== 0 || run.stopReason === "error" || run.stopReason === "aborted";
+
+      // Write result file for interop
+      const resultPath = `/tmp/subagent-${id}-result.md`;
+      try { writeFileSync(resultPath, output || "(no output)"); } catch {}
+
+      // Build injection message
+      const usageStr = formatUsage(run.usage, run.model);
+      let content: string;
+      if (isError) {
+        const err = run.errorMessage || stderr || "(no output)";
+        content = `## Subagent \`${id}\` failed (${elapsed})\n\n${err}`;
+      } else {
+        content = `## Subagent \`${id}\` completed (${elapsed}, ${usageStr})\n\n${output}`;
+      }
+
+      active.delete(id);
+      updateWidget();
+
+      pi.sendMessage(
+        { customType: "subagent-result", content, display: true },
+        { triggerTurn: true, deliverAs: "followUp" }
+      );
+    });
+
+    proc.on("error", () => {
+      run.exitCode = 1;
+      run.finishedAt = Date.now();
+      run.errorMessage = "Failed to spawn pi process";
+      active.delete(id);
+      updateWidget();
+
+      pi.sendMessage(
+        { customType: "subagent-result", content: `## Subagent \`${id}\` failed\n\nFailed to spawn pi process.`, display: true },
+        { triggerTurn: true, deliverAs: "followUp" }
+      );
+    });
+
+    // Don't keep parent alive waiting for child
     proc.unref();
-    return entry;
+    return run;
   }
 
-  /**
-   * Spawn in interactive mode: full pi in a tmux session.
-   * User can switch to the tmux window to watch or steer.
-   */
-  function spawnInteractive(id: string, task: string, cwd: string): SubagentEntry {
+  // ── Interactive mode: tmux ──
+
+  function isTargetAlive(target: string): boolean {
+    try {
+      execFileSync("tmux", ["display-message", "-t", target, "-p", ""], { stdio: "ignore" });
+      return true;
+    } catch { return false; }
+  }
+
+  function spawnInteractive(id: string, task: string, cwd: string): TrackedRun {
     const tmuxName = `subagent-${id}`;
     const resultFile = `/tmp/subagent-${id}-result.md`;
     const promptFile = `/tmp/subagent-${id}-prompt.md`;
 
-    // Detect the parent tmux session. Creating a new window inside it
-    // avoids iTerm2's tmux -CC capturing a new session (which redirects
-    // the pi pane and breaks prompt delivery).
     let parentSession = "";
     try {
       parentSession = execFileSync("tmux", ["display-message", "-p", "#{session_name}"],
         { encoding: "utf8" }).trim();
-    } catch { /* not in tmux */ }
+    } catch {}
 
     let pasteTarget: string;
 
     if (parentSession) {
-      // New window in the current session — shows as a tab in iTerm2
       pasteTarget = `${parentSession}:${tmuxName}`;
       execFileSync("tmux", [
         "new-window", "-t", parentSession, "-n", tmuxName, "-c", cwd, "pi",
       ], { stdio: "ignore" });
     } else {
-      // No parent session — fall back to detached session
       pasteTarget = tmuxName;
       execFileSync("tmux", [
         "new-session", "-d", "-s", tmuxName, "-c", cwd, "pi",
       ], { stdio: "ignore" });
-      // Detached sessions default to 80x24; resize so pi's TUI doesn't crash
       try {
         execFileSync("tmux", ["resize-window", "-t", tmuxName, "-x", "200", "-y", "50"],
           { stdio: "ignore" });
-      } catch { /* session may have died */ }
+      } catch {}
     }
 
-    // Build the prompt — instruct pi to write results and exit when done
     const framedTask = `${task}
 
 When you have completed the task, do these two things:
 1. Use the write tool to save your complete findings/summary to ${resultFile}
 2. Then say "SUBAGENT COMPLETE" so I know you're done.`;
 
-    // Wait for pi to finish loading, then paste the prompt as one block.
-    // tmux send-keys treats \n as Enter keypresses, splitting multi-line
-    // prompts into separate inputs. Use load-buffer + paste-buffer instead.
-    // Poll the pane until pi's status bar appears (indicates ready for input).
     const maxWaitMs = 30_000;
-    const pollMs = 1_000;
     const waitStart = Date.now();
-
     const readyPoller = setInterval(() => {
       try {
         const pane = execFileSync("tmux", ["capture-pane", "-t", pasteTarget, "-p"],
           { encoding: "utf8" });
-        const ready = /\$\d+\.\d+/.test(pane); // pi's cost indicator in status bar
+        const ready = /\$\d+\.\d+/.test(pane);
         if (!ready && Date.now() - waitStart < maxWaitMs) return;
 
         clearInterval(readyPoller);
@@ -226,61 +339,96 @@ When you have completed the task, do these two things:
         execFileSync("tmux", ["paste-buffer", "-dp", "-b", bufferName, "-t", pasteTarget], { stdio: "ignore" });
         execFileSync("tmux", ["send-keys", "-t", pasteTarget, "Enter"], { stdio: "ignore" });
       } catch {
-        // pane may have died
         if (Date.now() - waitStart >= maxWaitMs) clearInterval(readyPoller);
       }
-    }, pollMs);
+    }, 1000);
 
-    const entry: SubagentEntry = {
+    const run: TrackedRun = {
+      id,
+      task,
       mode: "interactive",
       startTime: Date.now(),
-      task,
-      resultFile,
+      messages: [],
+      usage: emptyUsage(),
       tmuxSession: pasteTarget,
+      resultFile,
     };
 
-    // Poll for completion: result file exists OR tmux target is gone
-    entry.watcher = setInterval(async () => {
+    const injectResult = async () => {
+      const elapsed = elapsedStr(run.startTime);
+      if (run.watcher) clearInterval(run.watcher);
+      active.delete(id);
+      updateWidget();
+
+      let content: string;
+      try {
+        const result = await readFile(resultFile, "utf8");
+        content = `## Subagent \`${id}\` completed (${elapsed})\n\n${result}`;
+      } catch {
+        let errMsg = "";
+        try { errMsg = await readFile(`/tmp/subagent-${id}-err.log`, "utf8"); } catch {}
+        content = `## Subagent \`${id}\` failed (${elapsed})\n\n${errMsg || "No output."}`;
+      }
+
+      pi.sendMessage(
+        { customType: "subagent-result", content, display: true },
+        { triggerTurn: true, deliverAs: "followUp" }
+      );
+      unlink(`/tmp/subagent-${id}-prompt.md`).catch(() => {});
+    };
+
+    run.watcher = setInterval(async () => {
       const alive = isTargetAlive(pasteTarget);
       let resultExists = false;
-      try {
-        await access(resultFile);
-        resultExists = true;
-      } catch {}
+      try { await access(resultFile); resultExists = true; } catch {}
 
       if (resultExists) {
         if (alive) {
-          // Result written but pi may still be wrapping up — short grace period
-          setTimeout(() => injectResult(id, entry), 3000);
-          if (entry.watcher) clearInterval(entry.watcher);
+          setTimeout(() => injectResult(), 3000);
+          if (run.watcher) clearInterval(run.watcher);
         } else {
-          injectResult(id, entry);
+          injectResult();
         }
       } else if (!alive) {
-        // Target died without writing result
-        injectResult(id, entry);
+        injectResult();
       }
     }, 5000);
 
-    return entry;
+    return run;
   }
 
-  function isTargetAlive(target: string): boolean {
-    try {
-      execFileSync("tmux", ["display-message", "-t", target, "-p", ""], { stdio: "ignore" });
-      return true;
-    } catch {
-      return false;
+  // ── Lifecycle ──
+
+  pi.on("session_start", async (_event, ctx) => {
+    widgetCtx = ctx;
+    for (const [, entry] of active) {
+      if (entry.watcher) clearInterval(entry.watcher);
     }
-  }
+    active.clear();
+  });
 
-  // ─── Tools ───────────────────────────────────────────────────────
+  pi.on("session_shutdown", async () => {
+    for (const [, entry] of active) {
+      if (entry.watcher) clearInterval(entry.watcher);
+    }
+    widgetCtx = null;
+  });
+
+  // Stash ctx from agent turns so widget works
+  pi.on("agent_turn_start", async (_event, ctx) => {
+    widgetCtx = ctx;
+  });
+
+  // ── Tools ──
 
   pi.registerTool({
     name: "subagent",
     label: "Subagent",
     description:
-      "Spawn a background pi subagent to work on a task. The subagent runs non-interactively with full tool access (read, bash, edit, write). Results are auto-injected back into this conversation when the subagent finishes. Use for research, analysis, code review, data gathering — anything that can run independently.",
+      "Spawn a background pi subagent to work on a task. " +
+      "Returns immediately — the subagent runs in the background with full tool access. " +
+      "Live progress shown in a widget. Results auto-inject when complete. " +
+      "Use for research, analysis, code review, data gathering — anything that can run independently.",
     promptSnippet: "Spawn background pi subagent — results auto-inject when done",
     promptGuidelines: [
       "Use subagent for independent tasks (research, analysis, review) that don't need user interaction",
@@ -292,22 +440,17 @@ When you have completed the task, do these two things:
     ],
     parameters: Type.Object({
       id: Type.String({
-        description:
-          "Short descriptive ID for this subagent (e.g. 'cr-review', 'coverage-check', 'error-research')",
+        description: "Short descriptive ID for this subagent (e.g. 'cr-review', 'coverage-check', 'error-research')",
       }),
       task: Type.String({
-        description:
-          "Detailed task description. Be specific — include file paths, URLs, criteria. The subagent has full tool access.",
+        description: "Detailed task description. Be specific — include file paths, URLs, criteria. The subagent has full tool access.",
       }),
       workingDir: Type.Optional(
-        Type.String({
-          description: "Working directory for the subagent (default: current directory)",
-        })
+        Type.String({ description: "Working directory for the subagent (default: current directory)" })
       ),
       interactive: Type.Optional(
         Type.Boolean({
-          description:
-            "If true, spawns a full pi session in a tmux window the user can switch to. Default: false (background pi -p).",
+          description: "If true, spawns a full pi session in a tmux window the user can switch to. Default: false (background pi -p).",
         })
       ),
     }),
@@ -315,40 +458,37 @@ When you have completed the task, do these two things:
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const { id, task, interactive } = params;
       const cwd = params.workingDir || ctx.cwd;
+      widgetCtx = ctx; // ensure widget works
 
       if (active.has(id)) {
-        throw new Error(
-          `Subagent '${id}' is already running. Use a different ID or wait for it to finish.`
-        );
+        throw new Error(`Subagent '${id}' is already running. Use a different ID or wait for it to finish.`);
       }
 
-      // Write prompt file (used by background mode runner)
-      await writeFile(`/tmp/subagent-${id}-prompt.md`, task, "utf8");
+      if (interactive) {
+        const run = spawnInteractive(id, task, cwd);
+        active.set(id, run);
+        updateWidget();
 
-      const entry = interactive
-        ? spawnInteractive(id, task, cwd)
-        : spawnBackground(id, task, cwd);
+        return {
+          content: [{
+            type: "text" as const,
+            text: `Subagent '${id}' spawned in tmux window. Switch to it:\n  tmux select-window -t ${run.tmuxSession}\nResults will auto-inject when complete.`,
+          }],
+          details: { id, mode: "interactive", tmuxSession: run.tmuxSession, cwd },
+        };
+      }
 
-      active.set(id, entry);
-
-      const modeInfo = interactive
-        ? `Interactive pi in tmux window 'subagent-${id}'. Switch to it:\n  tmux select-window -t ${entry.tmuxSession}`
-        : `Background process (PID: ${entry.pid})`;
+      // Background mode — fire and forget
+      const run = spawnBackground(id, task, cwd);
+      active.set(id, run);
+      updateWidget();
 
       return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Subagent '${id}' spawned. ${modeInfo}\nWorking in ${cwd}. Results will auto-inject when complete.`,
-          },
-        ],
-        details: {
-          id,
-          mode: interactive ? "interactive" : "background",
-          pid: entry.pid,
-          tmuxSession: entry.tmuxSession,
-          cwd,
-        },
+        content: [{
+          type: "text" as const,
+          text: `Subagent '${id}' spawned in background. Live progress in widget above. Results will auto-inject when complete.`,
+        }],
+        details: { id, mode: "background", cwd },
       };
     },
   });
@@ -369,23 +509,20 @@ When you have completed the task, do these two things:
       }
 
       const now = Date.now();
-      const lines = Array.from(active.entries()).map(([id, entry]) => {
-        const elapsed = Math.round((now - entry.startTime) / 1000);
-        const mode = entry.mode === "interactive" ? "tmux" : "bg";
-        const attach =
-          entry.mode === "interactive"
-            ? ` — \`tmux select-window -t ${entry.tmuxSession}\``
-            : "";
-        return `- **${id}** [${mode}] — running for ${elapsed}s${attach}`;
+      const lines = Array.from(active.entries()).map(([id, run]) => {
+        const elapsed = elapsedStr(run.startTime);
+        const mode = run.mode === "interactive" ? "tmux" : "bg";
+        const activity = run.lastToolCall ? ` — ${run.lastToolCall}` : "";
+        const usage = run.usage.turns > 0 ? ` [${formatUsage(run.usage)}]` : "";
+        const attach = run.tmuxSession ? ` — \`tmux select-window -t ${run.tmuxSession}\`` : "";
+        return `- **${id}** [${mode}] ${elapsed}${activity}${usage}${attach}`;
       });
 
       return {
-        content: [
-          {
-            type: "text" as const,
-            text: `**${active.size} subagent(s) running:**\n${lines.join("\n")}`,
-          },
-        ],
+        content: [{
+          type: "text" as const,
+          text: `**${active.size} subagent(s) running:**\n${lines.join("\n")}`,
+        }],
         details: { count: active.size, ids: Array.from(active.keys()) },
       };
     },
