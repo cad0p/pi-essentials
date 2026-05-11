@@ -274,7 +274,7 @@ export default function (pi: ExtensionAPI) {
       // run.signal) without a preceding error/aborted turn_end previously
       // routed through the "completed" branch — defeating the whole point of
       // capturing the signal. Including `run.signal` here ensures signal-killed
-      // subagents always surface through buildFailureBody with the signal field.
+      // subagents always surface through formatFailureBody with the signal field.
       const isError =
         run.exitCode !== 0 ||
         run.signal !== undefined ||
