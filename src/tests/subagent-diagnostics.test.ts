@@ -2,6 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   buildFailureBody,
+  fenceFor,
   STDERR_TAIL_BYTES,
 } from "../subagent-diagnostics.ts";
 
@@ -160,5 +161,33 @@ describe("buildFailureBody", () => {
       assert.match(body, /\*\*Status:\*\* stop=aborted/);
       assert.doesNotMatch(body, /no diagnostic information captured/);
     });
+  });
+});
+
+describe("fenceFor", () => {
+  it("default fence is 3 backticks when content has none", () => {
+    assert.equal(fenceFor("plain text\nno backticks"), "```");
+  });
+
+  it("single backtick in content still allows 3-backtick fence", () => {
+    assert.equal(fenceFor("has one ` inside"), "```");
+  });
+
+  it("double backtick in content still allows 3-backtick fence", () => {
+    assert.equal(fenceFor("has two `` inside"), "```");
+  });
+
+  it("triple backtick in content forces 4-backtick fence", () => {
+    assert.equal(fenceFor("has three ``` inside"), "````");
+  });
+
+  it("backtick runs are counted correctly across whitespace (non-contiguous runs don't aggregate)", () => {
+    // Two separate runs of 2 backticks — longest run is 2, fence is 3.
+    assert.equal(fenceFor("run 1: `` and run 2: ``"), "```");
+  });
+
+  it("very long run of backticks picks fence one longer", () => {
+    const content = "`".repeat(10);
+    assert.equal(fenceFor(content), "`".repeat(11));
   });
 });

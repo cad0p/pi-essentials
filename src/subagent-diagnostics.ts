@@ -31,6 +31,33 @@ export interface FailureDiagnostics {
 export const STDERR_TAIL_BYTES = 2000;
 
 /**
+ * Choose a backtick-fence long enough that it cannot collide with any
+ * run of backticks inside the content. CommonMark requires the opening
+ * and closing fences to share length and for any backticks inside the
+ * body to be shorter. A naked \`\`\` fence around stderr that itself
+ * contains \`\`\` (rare but real — e.g. a stderr trace that quoted a
+ * markdown snippet) splits the block in half and breaks the rendering
+ * for every consumer downstream.
+ *
+ * Exported for test coverage of the fence-length logic.
+ */
+export function fenceFor(content: string): string {
+  let longestRun = 0;
+  let currentRun = 0;
+  for (let i = 0; i < content.length; i++) {
+    if (content.charCodeAt(i) === 96 /* backtick */) {
+      currentRun++;
+      if (currentRun > longestRun) longestRun = currentRun;
+    } else {
+      currentRun = 0;
+    }
+  }
+  // Minimum fence is three backticks; otherwise one longer than the
+  // longest inner run.
+  return "`".repeat(Math.max(3, longestRun + 1));
+}
+
+/**
  * Render the body of a `## Subagent ... failed` message with all
  * diagnostic context available. Pure function — testable in isolation
  * (see `src/tests/subagent-diagnostics.test.ts`).
@@ -59,7 +86,8 @@ export function buildFailureBody(d: FailureDiagnostics): string {
       stderrTrimmed.length > STDERR_TAIL_BYTES
         ? `…(truncated; tail ${STDERR_TAIL_BYTES} bytes)\n${stderrTrimmed.slice(-STDERR_TAIL_BYTES)}`
         : stderrTrimmed;
-    parts.push("**stderr:**\n\n```\n" + tail + "\n```");
+    const fence = fenceFor(tail);
+    parts.push(`**stderr:**\n\n${fence}\n${tail}\n${fence}`);
   }
 
   if (d.lastToolCall && d.lastToolCall.trim()) {
