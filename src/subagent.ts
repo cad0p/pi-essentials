@@ -12,7 +12,7 @@ import { Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { spawn, execFileSync, type ChildProcess } from "node:child_process";
 import { writeFile, readFile, unlink, access } from "node:fs/promises";
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, writeFileSync, createWriteStream, type WriteStream } from "node:fs";
 import { homedir } from "node:os";
 import type { Message } from "@mariozechner/pi-ai";
 import { buildFailureBody } from "./subagent-diagnostics.ts";
@@ -234,6 +234,25 @@ export default function (pi: ExtensionAPI) {
     });
     run.proc = proc;
 
+    // Mirror the raw JSON event stream to /tmp for post-mortem analysis.
+    // Unlike result.md (final assistant text only) and err.log (stderr only),
+    // this captures every event pi emitted — tool calls, tool results,
+    // thinking blocks, message deltas. Essential when a subagent fails mid-run:
+    // `jq . < /tmp/subagent-<id>-events.jsonl` reconstructs what it was doing.
+    const eventsPath = `/tmp/subagent-${id}-events.jsonl`;
+    let eventStream: WriteStream | undefined;
+    try {
+      eventStream = createWriteStream(eventsPath, { flags: "w" });
+      // Swallow stream errors — a failure to write the post-mortem log should
+      // never cascade into the subagent's own execution.
+      eventStream.on("error", () => {
+        try { eventStream?.destroy(); } catch {}
+        eventStream = undefined;
+      });
+    } catch {
+      eventStream = undefined;
+    }
+
     let buffer = "";
     let stderr = "";
     let completed = false;
@@ -245,6 +264,9 @@ export default function (pi: ExtensionAPI) {
       if (buffer.trim()) processLine(buffer);
       run.exitCode = code;
       run.finishedAt = Date.now();
+
+      // Flush + close the post-mortem event log (best-effort).
+      try { eventStream?.end(); } catch {}
 
       const elapsed = elapsedStr(run.startTime, run.finishedAt);
       const output = getFinalText(run.messages);
@@ -268,7 +290,11 @@ export default function (pi: ExtensionAPI) {
           usageLine: run.usage.turns > 0 ? usageStr : undefined,
           finalText: output,
         });
-        content = `## Subagent \`${id}\` failed (${elapsed})\n\n${body}`;
+        // Footer points at the full raw event stream for post-mortem. Useful
+        // when the body above is thin — the .jsonl has every message/tool call
+        // pi emitted before the failure.
+        const footer = `_Post-mortem: \`jq . < ${eventsPath}\`_`;
+        content = `## Subagent \`${id}\` failed (${elapsed})\n\n${body}\n\n${footer}`;
       } else {
         content = `## Subagent \`${id}\` completed (${elapsed}, ${usageStr})\n\n${output}`;
       }
@@ -341,6 +367,7 @@ export default function (pi: ExtensionAPI) {
     };
 
     proc.stdout.on("data", (data: Buffer) => {
+      try { eventStream?.write(data); } catch {}
       buffer += data.toString();
       const lines = buffer.split("\n");
       buffer = lines.pop() || "";
