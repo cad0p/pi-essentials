@@ -270,7 +270,16 @@ export default function (pi: ExtensionAPI) {
 
       const elapsed = elapsedStr(run.startTime, run.finishedAt);
       const output = getFinalText(run.messages);
-      const isError = run.exitCode !== 0 || run.stopReason === "error" || run.stopReason === "aborted";
+      // A signal-only kill (`code === null` in proc.close, captured into
+      // run.signal) without a preceding error/aborted turn_end previously
+      // routed through the "completed" branch — defeating the whole point of
+      // capturing the signal. Including `run.signal` here ensures signal-killed
+      // subagents always surface through buildFailureBody with the signal field.
+      const isError =
+        run.exitCode !== 0 ||
+        run.signal !== undefined ||
+        run.stopReason === "error" ||
+        run.stopReason === "aborted";
 
       // Write result file for interop
       const resultPath = `/tmp/subagent-${id}-result.md`;
