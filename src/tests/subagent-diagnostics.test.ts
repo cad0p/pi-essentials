@@ -219,10 +219,25 @@ describe("truncateTail", () => {
     assert.ok(out.length <= 256, "output length never exceeds maxChars");
   });
 
-  it("reports the correct truncated-byte count in the suffix", () => {
+  it("reports the actual chars dropped (including suffix budget)", () => {
+    // The suffix counts against the budget: if maxChars=100 and s.length=500,
+    // naive arithmetic says 400 chars were dropped, but the suffix itself
+    // takes ~22 chars away from `keep`, so the true number dropped is ~422.
     const s = "a".repeat(500);
     const out = truncateTail(s, 100);
-    assert.match(out, /…\(400 chars truncated\)$/);
+    const match = out.match(/…\((\d+) chars truncated\)$/);
+    assert.ok(match, "output has truncated-count suffix");
+    const reportedCount = Number(match![1]);
+    // The invariant: reportedCount === s.length - (out.length - suffix.length)
+    // which simplifies to: reportedCount === s.length - keep, and keep is
+    // chosen so that keep + suffix.length === maxChars. So the reported
+    // count must be strictly larger than the naive (s.length - maxChars).
+    assert.ok(
+      reportedCount > s.length - 100,
+      `reported ${reportedCount} should exceed naive ${s.length - 100}`,
+    );
+    // And the total output still fits within the cap.
+    assert.ok(out.length <= 100);
   });
 
   it("head is preserved verbatim (tail is the cheap loss)", () => {

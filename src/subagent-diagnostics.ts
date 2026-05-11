@@ -73,15 +73,26 @@ export const DEFAULT_MAX_ACTIVITY_EVENTS = 20;
  * If longer, keeps the first `maxChars - suffix.length` characters and
  * appends a suffix declaring the truncated-byte count so the reader
  * can correlate with the full value in events.jsonl.
+ *
+ * The truncated count is the **actual** number of chars dropped
+ * (`s.length - keep`), not the naive `s.length - maxChars` — they differ
+ * by the suffix length, and the suffix counts against the budget.
+ * Converges in one iteration for realistic inputs; a second pass covers
+ * the rare case where the true count's digit width differs from the
+ * first-pass approximation (e.g., first pass assumed "99 chars" but the
+ * true count is 100, shifting the suffix by 1 char).
  */
 export function truncateTail(s: string, maxChars: number): string {
   if (s.length <= maxChars) return s;
-  // Tail-strip: head of the string usually carries the identifying
-  // info (command name, first path segments). Tail is the cheap loss.
-  const truncatedCount = s.length - maxChars;
-  const suffix = `…(${truncatedCount} chars truncated)`;
-  // Reserve room for the suffix; guarantees the output length never
-  // exceeds maxChars even after appending.
+  let truncated = s.length - maxChars; // first-pass approximation
+  for (let i = 0; i < 3; i++) {
+    const suffix = `…(${truncated} chars truncated)`;
+    const keep = Math.max(0, maxChars - suffix.length);
+    const actual = s.length - keep;
+    if (actual === truncated) break;
+    truncated = actual;
+  }
+  const suffix = `…(${truncated} chars truncated)`;
   const keep = Math.max(0, maxChars - suffix.length);
   return s.slice(0, keep) + suffix;
 }

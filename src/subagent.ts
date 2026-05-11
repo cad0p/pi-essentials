@@ -15,7 +15,11 @@ import { writeFile, readFile, unlink, access } from "node:fs/promises";
 import { existsSync, writeFileSync, createWriteStream, type WriteStream } from "node:fs";
 import { homedir } from "node:os";
 import type { Message } from "@mariozechner/pi-ai";
-import { formatFailureBody } from "./subagent-diagnostics.ts";
+import {
+  buildActivityTrail,
+  formatFailureBody,
+  type ToolCallEvent,
+} from "./subagent-diagnostics.ts";
 
 // ── Types ──────────────────────────────────────────────────────────────
 
