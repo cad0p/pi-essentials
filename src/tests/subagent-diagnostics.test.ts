@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
-  buildFailureBody,
+  formatFailureBody,
   fenceFor,
   STDERR_TAIL_BYTES,
 } from "../subagent-diagnostics.ts";
@@ -14,10 +14,10 @@ import {
  * before the PR #X / fix/subagent-diagnostic-info branch.
  */
 
-describe("buildFailureBody", () => {
+describe("formatFailureBody", () => {
   describe("fallback path", () => {
     it("empty input returns the explicit fallback, not an empty string", () => {
-      const body = buildFailureBody({});
+      const body = formatFailureBody({});
       assert.match(body, /no diagnostic information captured/);
       // The phrasing MUST surface that the failure info was lost — not
       // imply "(no output)" as if that were the subagent's own response.
@@ -25,13 +25,13 @@ describe("buildFailureBody", () => {
     });
 
     it("undefined/empty strings are treated as absent (don't render empty sections)", () => {
-      const body = buildFailureBody({
+      const body = formatFailureBody({
         errorMessage: "",
         stopReason: undefined,
         stderr: "   ",
         lastToolCall: "",
         usageLine: "",
-        finalText: "",
+        partialOutput: "",
       });
       assert.match(body, /no diagnostic information captured/);
     });
@@ -39,24 +39,24 @@ describe("buildFailureBody", () => {
 
   describe("sections render only when relevant", () => {
     it("errorMessage renders as **Error:** line", () => {
-      const body = buildFailureBody({ errorMessage: "Rate limit exceeded" });
+      const body = formatFailureBody({ errorMessage: "Rate limit exceeded" });
       assert.match(body, /\*\*Error:\*\* Rate limit exceeded/);
     });
 
     it("status omits stopReason='end_turn' (normal completion)", () => {
-      const body = buildFailureBody({ stopReason: "end_turn", exitCode: 1 });
+      const body = formatFailureBody({ stopReason: "end_turn", exitCode: 1 });
       assert.doesNotMatch(body, /end_turn/);
-      assert.match(body, /exit=1/);
+      assert.match(body, /\bexit=1\b/);
     });
 
     it("status omits exitCode=0 (even on failure paths where signal is the real cause)", () => {
-      const body = buildFailureBody({ exitCode: 0, signal: "SIGTERM" });
+      const body = formatFailureBody({ exitCode: 0, signal: "SIGTERM" });
       assert.doesNotMatch(body, /exit=0/);
       assert.match(body, /signal=SIGTERM/);
     });
 
     it("status renders all non-trivial fields in one line", () => {
-      const body = buildFailureBody({
+      const body = formatFailureBody({
         stopReason: "error",
         exitCode: 1,
         signal: "SIGTERM",
@@ -65,7 +65,7 @@ describe("buildFailureBody", () => {
     });
 
     it("stderr wraps in a fenced code block", () => {
-      const body = buildFailureBody({
+      const body = formatFailureBody({
         stderr: "something broke\nmore context",
       });
       assert.match(body, /\*\*stderr:\*\*/);
@@ -77,30 +77,30 @@ describe("buildFailureBody", () => {
       const head = "HEAD_MARKER_SHOULD_BE_GONE\n";
       const mid = "x".repeat(STDERR_TAIL_BYTES);
       const tail = "\nTAIL_MARKER_SHOULD_REMAIN";
-      const body = buildFailureBody({ stderr: head + mid + tail });
+      const body = formatFailureBody({ stderr: head + mid + tail });
       assert.match(body, /TAIL_MARKER_SHOULD_REMAIN/);
       assert.doesNotMatch(body, /HEAD_MARKER_SHOULD_BE_GONE/);
       assert.match(body, /\(truncated; tail 2000 bytes\)/);
     });
 
     it("lastToolCall renders verbatim", () => {
-      const body = buildFailureBody({ lastToolCall: "$ ls /some/path" });
+      const body = formatFailureBody({ lastToolCall: "$ ls /some/path" });
       assert.match(body, /\*\*Last activity:\*\* \$ ls \/some\/path/);
     });
 
     it("usageLine renders verbatim", () => {
-      const body = buildFailureBody({ usageLine: "5t ↑100k ↓1k $0.05" });
+      const body = formatFailureBody({ usageLine: "5t ↑100k ↓1k $0.05" });
       assert.match(body, /\*\*Usage before failure:\*\* 5t ↑100k ↓1k \$0.05/);
     });
 
     it("finalText renders as partial output when non-empty", () => {
-      const body = buildFailureBody({ finalText: "I was trying to help." });
+      const body = formatFailureBody({ partialOutput: "I was trying to help." });
       assert.match(body, /\*\*Partial output:\*\*/);
       assert.match(body, /I was trying to help\./);
     });
 
     it("finalText='(no output)' is suppressed — it's the subagent's own no-output marker, not useful context", () => {
-      const body = buildFailureBody({ finalText: "(no output)" });
+      const body = formatFailureBody({ partialOutput: "(no output)" });
       assert.doesNotMatch(body, /Partial output/);
       assert.match(body, /no diagnostic information captured/);
     });
@@ -108,7 +108,7 @@ describe("buildFailureBody", () => {
 
   describe("composition", () => {
     it("full failure renders every section in stable order", () => {
-      const body = buildFailureBody({
+      const body = formatFailureBody({
         errorMessage: "Rate limit exceeded",
         stopReason: "error",
         exitCode: 1,
@@ -116,7 +116,7 @@ describe("buildFailureBody", () => {
         stderr: "upstream returned 429",
         lastToolCall: "$ ls /x",
         usageLine: "5t ↑100k",
-        finalText: "I was trying to help.",
+        partialOutput: "I was trying to help.",
       });
 
       // Order: Error → Status → stderr → Last activity → Usage → Partial output
@@ -136,7 +136,7 @@ describe("buildFailureBody", () => {
     });
 
     it("sections are separated by blank lines (render as discrete markdown blocks)", () => {
-      const body = buildFailureBody({
+      const body = formatFailureBody({
         errorMessage: "err",
         lastToolCall: "$ x",
       });
@@ -148,16 +148,16 @@ describe("buildFailureBody", () => {
       // pi -p's subprocess gets SIGTERM'd mid-run. exitCode is null (→ undefined
       // here), signal is SIGTERM, no errorMessage, empty stderr. Previously
       // rendered as literally "(no output)"; should now surface the signal.
-      const body = buildFailureBody({
+      const body = formatFailureBody({
         signal: "SIGTERM",
-        finalText: "Now I'll write the deliverable.",
+        partialOutput: "Now I'll write the deliverable.",
       });
       assert.match(body, /signal=SIGTERM/);
       assert.match(body, /Now I'll write the deliverable\./);
     });
 
     it("thin-diagnostic case (only stopReason='aborted', nothing else) still fires a Status line", () => {
-      const body = buildFailureBody({ stopReason: "aborted" });
+      const body = formatFailureBody({ stopReason: "aborted" });
       assert.match(body, /\*\*Status:\*\* stop=aborted/);
       assert.doesNotMatch(body, /no diagnostic information captured/);
     });

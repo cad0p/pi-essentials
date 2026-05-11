@@ -15,7 +15,7 @@ import { writeFile, readFile, unlink, access } from "node:fs/promises";
 import { existsSync, writeFileSync, createWriteStream, type WriteStream } from "node:fs";
 import { homedir } from "node:os";
 import type { Message } from "@mariozechner/pi-ai";
-import { buildFailureBody } from "./subagent-diagnostics.ts";
+import { formatFailureBody } from "./subagent-diagnostics.ts";
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -289,7 +289,7 @@ export default function (pi: ExtensionAPI) {
       const usageStr = formatUsage(run.usage, run.model);
       let content: string;
       if (isError) {
-        const body = buildFailureBody({
+        const body = formatFailureBody({
           errorMessage: run.errorMessage,
           stopReason: run.stopReason,
           exitCode: run.exitCode,
@@ -297,13 +297,13 @@ export default function (pi: ExtensionAPI) {
           stderr,
           lastToolCall: run.lastToolCall,
           usageLine: run.usage.turns > 0 ? usageStr : undefined,
-          finalText: output,
+          partialOutput: output,
         });
-        // Footer points at the full raw event stream for post-mortem. Useful
-        // when the body above is thin — the .jsonl has every message/tool call
-        // pi emitted before the failure.
-        const footer = `_Post-mortem: \`jq . < ${eventsPath}\`_`;
-        content = `## Subagent \`${id}\` failed (${elapsed})\n\n${body}\n\n${footer}`;
+        // Only point at the events file if the stream was successfully opened.
+        const footer = eventStream
+          ? `_Post-mortem: \`jq . < ${eventsPath}\`_`
+          : "";
+        content = `## Subagent \`${id}\` failed (${elapsed})\n\n${body}${footer ? `\n\n${footer}` : ""}`;
       } else {
         content = `## Subagent \`${id}\` completed (${elapsed}, ${usageStr})\n\n${output}`;
       }

@@ -19,8 +19,13 @@ export interface FailureDiagnostics {
   signal?: NodeJS.Signals;
   stderr?: string;
   lastToolCall?: string;
+  /** Pre-formatted usage string (e.g. "5t ↑100k ↓1k $0.05"). Passed as a
+   *  string rather than a structured Usage object to keep this module free
+   *  of the peer-dep imports that carry the Usage type. */
   usageLine?: string;
-  finalText?: string;
+  /** Partial assistant text produced before the failure. Named 'partialOutput'
+   *  to match the **Partial output:** section label shown to the reader. */
+  partialOutput?: string;
 }
 
 /**
@@ -67,7 +72,7 @@ export function fenceFor(content: string): string {
  * than silent emptiness because it tells the parent agent that the
  * harness itself lost the failure detail.
  */
-export function buildFailureBody(d: FailureDiagnostics): string {
+export function formatFailureBody(d: FailureDiagnostics): string {
   const parts: string[] = [];
 
   if (d.errorMessage && d.errorMessage.trim()) {
@@ -75,7 +80,8 @@ export function buildFailureBody(d: FailureDiagnostics): string {
   }
 
   const meta: string[] = [];
-  if (d.stopReason && d.stopReason !== "end_turn") meta.push(`stop=${d.stopReason}`);
+  // Suppress "end_turn" — it signals normal completion, not a failure mode.
+  if (d.stopReason && d.stopReason.trim() !== "end_turn") meta.push(`stop=${d.stopReason.trim()}`);
   if (d.exitCode !== undefined && d.exitCode !== 0) meta.push(`exit=${d.exitCode}`);
   if (d.signal) meta.push(`signal=${d.signal}`);
   if (meta.length > 0) parts.push(`**Status:** ${meta.join(", ")}`);
@@ -98,12 +104,12 @@ export function buildFailureBody(d: FailureDiagnostics): string {
     parts.push(`**Usage before failure:** ${d.usageLine.trim()}`);
   }
 
-  const finalTextTrimmed = (d.finalText || "").trim();
-  if (finalTextTrimmed && finalTextTrimmed !== "(no output)") {
-    parts.push(`**Partial output:**\n\n${finalTextTrimmed}`);
+  const partialOutputTrimmed = (d.partialOutput || "").trim();
+  if (partialOutputTrimmed && partialOutputTrimmed !== "(no output)") {
+    parts.push(`**Partial output:**\n\n${partialOutputTrimmed}`);
   }
 
   return parts.length === 0
-    ? "(no diagnostic information captured — the harness lost the failure detail)"
+    ? "(no diagnostic information captured — check the post-mortem .jsonl)"
     : parts.join("\n\n");
 }
