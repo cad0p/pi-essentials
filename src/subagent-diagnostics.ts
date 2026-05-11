@@ -81,6 +81,12 @@ export const DEFAULT_MAX_ACTIVITY_EVENTS = 20;
  * the rare case where the true count's digit width differs from the
  * first-pass approximation (e.g., first pass assumed "99 chars" but the
  * true count is 100, shifting the suffix by 1 char).
+ *
+ * Output-length invariant: `out.length <= maxChars` holds **for
+ * `maxChars >= suffix.length` (~21 chars)**, which covers every caller
+ * in this module. Below that threshold the suffix itself exceeds the
+ * cap and the output degrades to the suffix alone (still longer than
+ * maxChars). No caller is allowed to go that small in practice.
  */
 export function truncateTail(s: string, maxChars: number): string {
   if (s.length <= maxChars) return s;
@@ -175,6 +181,10 @@ export function buildActivityTrail(
 ): string {
   if (events.length === 0) return "";
   const maxEvents = opts.maxEvents ?? DEFAULT_MAX_ACTIVITY_EVENTS;
+  // maxEvents ≤ 0 would otherwise render a header over an empty bullet
+  // list — the dangling-header artifact the correctness review flagged.
+  // Treat as "nothing to show" and defer to the caller to omit the section.
+  if (maxEvents <= 0) return "";
   const maxLineChars = opts.maxLineChars ?? MAX_ACTIVITY_LINE_CHARS;
 
   const total = events.length;

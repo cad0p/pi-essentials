@@ -246,6 +246,20 @@ describe("truncateTail", () => {
     const out = truncateTail(head + tail, 100);
     assert.ok(out.startsWith(head), "identifying prefix is intact");
   });
+
+  it("degenerate maxChars=0: output degrades to suffix alone (invariant documented)", () => {
+    // Documents the corner-case: suffix is ~21 chars; when maxChars=0 there's
+    // no room for content. Output exceeds the cap in this case — the
+    // invariant only holds for maxChars >= suffix.length. No caller in the
+    // module is allowed to go this small; this test pins the degraded
+    // behaviour so any future caller knows what to expect.
+    const s = "abc";
+    const out = truncateTail(s, 0);
+    assert.match(out, /…\(\d+ chars truncated\)$/);
+    // Output DOES exceed the cap here — that's by design; the alternative
+    // (silently dropping the suffix) would hide the truncation entirely.
+    assert.ok(out.length > 0);
+  });
 });
 
 describe("formatToolCallFull", () => {
@@ -325,6 +339,27 @@ describe("formatToolCallFull", () => {
     const out = formatToolCallFull(event, 50);
     assert.ok(out.length <= 50);
   });
+
+  it("unknown tool with JSON.stringify-throwing args falls back to '(unserializable args)'", () => {
+    // BigInt serialization throws TypeError. The try/catch should swallow it.
+    const event: ToolCallEvent = {
+      name: "custom-thing",
+      arguments: { big: BigInt(1) as unknown as string },
+    };
+    const out = formatToolCallFull(event);
+    assert.match(out, /- custom-thing: \(unserializable args\)$/);
+  });
+
+  it("unknown tool with circular-ref args falls back to '(unserializable args)'", () => {
+    const circular: Record<string, unknown> = { name: "loop" };
+    circular.self = circular;
+    const event: ToolCallEvent = {
+      name: "custom-thing",
+      arguments: circular,
+    };
+    const out = formatToolCallFull(event);
+    assert.match(out, /- custom-thing: \(unserializable args\)$/);
+  });
 });
 
 describe("buildActivityTrail", () => {
@@ -339,6 +374,31 @@ describe("buildActivityTrail", () => {
 
   it("returns empty string on empty input (caller can guard and omit)", () => {
     assert.equal(buildActivityTrail([]), "");
+  });
+
+  it("empty events + eventsFile still returns empty string (contract: no header without content)", () => {
+    assert.equal(
+      buildActivityTrail([], { eventsFile: "/tmp/x.jsonl" }),
+      "",
+      "eventsFile is ignored when there are no events to point at",
+    );
+  });
+
+  it("maxEvents=0 returns empty string (no dangling header)", () => {
+    // Edge case: the shown window would be [], producing a header over
+    // an empty bullet list. Treated as "nothing to show" at the contract
+    // boundary so callers don't have to special-case it.
+    assert.equal(
+      buildActivityTrail([mkBash("ls"), mkBash("pwd")], { maxEvents: 0 }),
+      "",
+    );
+  });
+
+  it("negative maxEvents also returns empty string", () => {
+    assert.equal(
+      buildActivityTrail([mkBash("ls")], { maxEvents: -5 }),
+      "",
+    );
   });
 
   it("renders single-event trail with 'N tool call' header (singular)", () => {
@@ -370,6 +430,10 @@ describe("buildActivityTrail", () => {
     // Oldest events elided
     assert.doesNotMatch(out, /cmd-0\b/);
     assert.doesNotMatch(out, /cmd-4\b/);
+    // First kept event at the slice boundary (cap+5 total, keep last 20 →
+    // first kept is index 5). Pins the slice boundary so future changes
+    // don't silently shift which events get elided.
+    assert.match(out, /cmd-5\b/);
     // Recent events kept
     assert.match(out, /cmd-24\b/);
     // Header reports the elision
