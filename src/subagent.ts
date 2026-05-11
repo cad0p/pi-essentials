@@ -289,13 +289,32 @@ export default function (pi: ExtensionAPI) {
       const usageStr = formatUsage(run.usage, run.model);
       let content: string;
       if (isError) {
+        // Harvest the full tool-call trail from the subagent's assistant
+        // messages. The extension already tracks `run.lastToolCall` for the
+        // widget; the failure body gets the complete (capped) trail so the
+        // parent agent can decide its next move without opening events.jsonl.
+        const events: ToolCallEvent[] = [];
+        for (const msg of run.messages) {
+          if (msg.role !== "assistant") continue;
+          for (const part of msg.content) {
+            if (part.type === "toolCall") {
+              events.push({
+                name: part.name,
+                arguments: part.arguments as Record<string, unknown>,
+              });
+            }
+          }
+        }
+        const activityTrail = buildActivityTrail(events, {
+          eventsFile: eventStream ? eventsPath : undefined,
+        });
         const body = formatFailureBody({
           errorMessage: run.errorMessage,
           stopReason: run.stopReason,
           exitCode: run.exitCode,
           signal: run.signal,
           stderr,
-          lastToolCall: run.lastToolCall,
+          activityTrail,
           usageLine: run.usage.turns > 0 ? usageStr : undefined,
           partialOutput: output,
         });

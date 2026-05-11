@@ -1,9 +1,15 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
-  formatFailureBody,
+  buildActivityTrail,
+  DEFAULT_MAX_ACTIVITY_EVENTS,
   fenceFor,
+  formatFailureBody,
+  formatToolCallFull,
+  MAX_ACTIVITY_LINE_CHARS,
   STDERR_TAIL_BYTES,
+  type ToolCallEvent,
+  truncateTail,
 } from "../subagent-diagnostics.ts";
 
 /**
@@ -29,7 +35,7 @@ describe("formatFailureBody", () => {
         errorMessage: "",
         stopReason: undefined,
         stderr: "   ",
-        lastToolCall: "",
+        activityTrail: "",
         usageLine: "",
         partialOutput: "",
       });
@@ -83,9 +89,13 @@ describe("formatFailureBody", () => {
       assert.match(body, /\(truncated; tail 2000 bytes\)/);
     });
 
-    it("lastToolCall renders verbatim", () => {
-      const body = formatFailureBody({ lastToolCall: "$ ls /some/path" });
-      assert.match(body, /\*\*Last activity:\*\* \$ ls \/some\/path/);
+    it("activityTrail renders verbatim as a markdown block", () => {
+      const trail =
+        "**Activity (2 tool calls):**\n\n- read: /some/path\n- bash: $ ls";
+      const body = formatFailureBody({ activityTrail: trail });
+      assert.match(body, /\*\*Activity \(2 tool calls\):\*\*/);
+      assert.match(body, /- read: \/some\/path/);
+      assert.match(body, /- bash: \$ ls/);
     });
 
     it("usageLine renders verbatim", () => {
@@ -114,16 +124,16 @@ describe("formatFailureBody", () => {
         exitCode: 1,
         signal: "SIGTERM",
         stderr: "upstream returned 429",
-        lastToolCall: "$ ls /x",
+        activityTrail: "**Activity (1 tool call):**\n\n- bash: $ ls /x",
         usageLine: "5t ↑100k",
         partialOutput: "I was trying to help.",
       });
 
-      // Order: Error → Status → stderr → Last activity → Usage → Partial output
+      // Order: Error → Status → stderr → Activity → Usage → Partial output
       const iError = body.indexOf("**Error:**");
       const iStatus = body.indexOf("**Status:**");
       const iStderr = body.indexOf("**stderr:**");
-      const iActivity = body.indexOf("**Last activity:**");
+      const iActivity = body.indexOf("**Activity (");
       const iUsage = body.indexOf("**Usage before failure:**");
       const iPartial = body.indexOf("**Partial output:**");
 
@@ -138,9 +148,9 @@ describe("formatFailureBody", () => {
     it("sections are separated by blank lines (render as discrete markdown blocks)", () => {
       const body = formatFailureBody({
         errorMessage: "err",
-        lastToolCall: "$ x",
+        activityTrail: "**Activity (1 tool call):**\n\n- bash: $ x",
       });
-      assert.match(body, /\*\*Error:\*\* err\n\n\*\*Last activity:\*\*/);
+      assert.match(body, /\*\*Error:\*\* err\n\n\*\*Activity \(/);
     });
 
     it("signal-kill with otherwise clean exit still surfaces the signal", () => {
@@ -189,5 +199,200 @@ describe("fenceFor", () => {
   it("very long run of backticks picks fence one longer", () => {
     const content = "`".repeat(10);
     assert.equal(fenceFor(content), "`".repeat(11));
+  });
+});
+
+describe("truncateTail", () => {
+  it("short strings pass through unchanged", () => {
+    assert.equal(truncateTail("hello", 100), "hello");
+  });
+
+  it("exact-length string is not truncated", () => {
+    const s = "a".repeat(256);
+    assert.equal(truncateTail(s, 256), s);
+  });
+
+  it("long string is tail-stripped with '…(N chars truncated)' suffix", () => {
+    const s = "a".repeat(300);
+    const out = truncateTail(s, 256);
+    assert.match(out, /…\(\d+ chars truncated\)$/);
+    assert.ok(out.length <= 256, "output length never exceeds maxChars");
+  });
+
+  it("reports the correct truncated-byte count in the suffix", () => {
+    const s = "a".repeat(500);
+    const out = truncateTail(s, 100);
+    assert.match(out, /…\(400 chars truncated\)$/);
+  });
+
+  it("head is preserved verbatim (tail is the cheap loss)", () => {
+    const head = "IDENTIFYING_PREFIX ";
+    const tail = "x".repeat(500);
+    const out = truncateTail(head + tail, 100);
+    assert.ok(out.startsWith(head), "identifying prefix is intact");
+  });
+});
+
+describe("formatToolCallFull", () => {
+  it("bash renders as '- bash: $ <full command>'", () => {
+    const event: ToolCallEvent = {
+      name: "bash",
+      arguments: { command: "ls -la /foo" },
+    };
+    assert.equal(formatToolCallFull(event), "- bash: $ ls -la /foo");
+  });
+
+  it("read/write/edit render with full file_path, no home-tilde collapse", () => {
+    const longPath =
+      "/local/home/someone/workplace/deeply/nested/project/src/file.ts";
+    for (const name of ["read", "write", "edit"]) {
+      const event: ToolCallEvent = {
+        name,
+        arguments: { file_path: longPath },
+      };
+      const out = formatToolCallFull(event);
+      assert.equal(out, `- ${name}: ${longPath}`);
+      assert.doesNotMatch(out, /^\s*- \w+: ~/, "no ~ collapse");
+    }
+  });
+
+  it("falls back to `path` if `file_path` is absent (legacy key)", () => {
+    const event: ToolCallEvent = {
+      name: "read",
+      arguments: { path: "/legacy/path.txt" },
+    };
+    assert.equal(formatToolCallFull(event), "- read: /legacy/path.txt");
+  });
+
+  it("grep renders pattern + search path", () => {
+    const event: ToolCallEvent = {
+      name: "grep",
+      arguments: { pattern: "needle", path: "/haystack" },
+    };
+    assert.equal(formatToolCallFull(event), "- grep: needle in /haystack");
+  });
+
+  it("grep defaults to '.' when no path is given", () => {
+    const event: ToolCallEvent = {
+      name: "grep",
+      arguments: { pattern: "x" },
+    };
+    assert.equal(formatToolCallFull(event), "- grep: x in .");
+  });
+
+  it("unknown tools render their args as compact JSON", () => {
+    const event: ToolCallEvent = {
+      name: "custom-thing",
+      arguments: { foo: "bar", n: 42 },
+    };
+    const out = formatToolCallFull(event);
+    assert.match(out, /^- custom-thing: /);
+    assert.match(out, /"foo":"bar"/);
+  });
+
+  it("truncates at MAX_ACTIVITY_LINE_CHARS (256) by default", () => {
+    const longCmd = "a".repeat(500);
+    const event: ToolCallEvent = {
+      name: "bash",
+      arguments: { command: longCmd },
+    };
+    const out = formatToolCallFull(event);
+    assert.ok(out.length <= MAX_ACTIVITY_LINE_CHARS,
+      `line length ${out.length} exceeds cap ${MAX_ACTIVITY_LINE_CHARS}`);
+    assert.match(out, /…\(\d+ chars truncated\)$/);
+  });
+
+  it("accepts a custom maxLineChars override", () => {
+    const event: ToolCallEvent = {
+      name: "bash",
+      arguments: { command: "a".repeat(200) },
+    };
+    const out = formatToolCallFull(event, 50);
+    assert.ok(out.length <= 50);
+  });
+});
+
+describe("buildActivityTrail", () => {
+  const mkBash = (cmd: string): ToolCallEvent => ({
+    name: "bash",
+    arguments: { command: cmd },
+  });
+  const mkRead = (path: string): ToolCallEvent => ({
+    name: "read",
+    arguments: { file_path: path },
+  });
+
+  it("returns empty string on empty input (caller can guard and omit)", () => {
+    assert.equal(buildActivityTrail([]), "");
+  });
+
+  it("renders single-event trail with 'N tool call' header (singular)", () => {
+    const out = buildActivityTrail([mkBash("ls")]);
+    assert.match(out, /\*\*Activity \(1 tool call\):\*\*/);
+    assert.match(out, /- bash: \$ ls/);
+  });
+
+  it("renders multi-event trail with 'N tool calls' header (plural)", () => {
+    const out = buildActivityTrail([mkBash("ls"), mkRead("/foo")]);
+    assert.match(out, /\*\*Activity \(2 tool calls\):\*\*/);
+  });
+
+  it("preserves chronological order (oldest first in the shown window)", () => {
+    const events = [mkBash("first"), mkBash("second"), mkBash("third")];
+    const out = buildActivityTrail(events);
+    const iFirst = out.indexOf("first");
+    const iSecond = out.indexOf("second");
+    const iThird = out.indexOf("third");
+    assert.ok(iFirst >= 0 && iSecond > iFirst && iThird > iSecond);
+  });
+
+  it("caps at DEFAULT_MAX_ACTIVITY_EVENTS, showing the most recent N", () => {
+    const many: ToolCallEvent[] = Array.from(
+      { length: DEFAULT_MAX_ACTIVITY_EVENTS + 5 },
+      (_, i) => mkBash(`cmd-${i}`),
+    );
+    const out = buildActivityTrail(many);
+    // Oldest events elided
+    assert.doesNotMatch(out, /cmd-0\b/);
+    assert.doesNotMatch(out, /cmd-4\b/);
+    // Recent events kept
+    assert.match(out, /cmd-24\b/);
+    // Header reports the elision
+    assert.match(out, /showing last 20/);
+    assert.match(out, /5 older elided/);
+  });
+
+  it("when eventsFile is provided and events are elided, points reader at the file", () => {
+    const many = Array.from({ length: 25 }, (_, i) => mkBash(`cmd-${i}`));
+    const out = buildActivityTrail(many, {
+      eventsFile: "/tmp/subagent-xyz-events.jsonl",
+    });
+    assert.match(out, /older 5 in \/tmp\/subagent-xyz-events\.jsonl/);
+  });
+
+  it("when eventsFile is provided but nothing is elided, still points at the file for truncation-recovery", () => {
+    const out = buildActivityTrail([mkBash("ls")], {
+      eventsFile: "/tmp/subagent-xyz-events.jsonl",
+    });
+    assert.match(out, /full events in \/tmp\/subagent-xyz-events\.jsonl/);
+  });
+
+  it("respects a custom maxEvents override", () => {
+    const events = [mkBash("a"), mkBash("b"), mkBash("c"), mkBash("d")];
+    const out = buildActivityTrail(events, { maxEvents: 2 });
+    assert.match(out, /showing last 2/);
+    assert.match(out, /2 older elided/);
+    assert.match(out, /- bash: \$ c/);
+    assert.match(out, /- bash: \$ d/);
+    assert.doesNotMatch(out, /- bash: \$ a\b/);
+  });
+
+  it("truncates per-line at the configured maxLineChars", () => {
+    const events = [mkBash("a".repeat(500))];
+    const out = buildActivityTrail(events, { maxLineChars: 100 });
+    const lines = out.split("\n").filter((l) => l.startsWith("- "));
+    for (const line of lines) {
+      assert.ok(line.length <= 100, `line exceeds cap: ${line.length}`);
+    }
   });
 });
