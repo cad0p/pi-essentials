@@ -15,6 +15,7 @@ import { writeFile, readFile, unlink, access } from "node:fs/promises";
 import { existsSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import type { Message } from "@mariozechner/pi-ai";
+import { buildFailureBody } from "./subagent-diagnostics.ts";
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -34,6 +35,7 @@ interface TrackedRun {
   startTime: number;
   finishedAt?: number;
   exitCode?: number;
+  signal?: NodeJS.Signals;
   // Background-only streaming state
   messages: Message[];
   usage: Usage;
@@ -256,8 +258,17 @@ export default function (pi: ExtensionAPI) {
       const usageStr = formatUsage(run.usage, run.model);
       let content: string;
       if (isError) {
-        const err = run.errorMessage || stderr || "(no output)";
-        content = `## Subagent \`${id}\` failed (${elapsed})\n\n${err}`;
+        const body = buildFailureBody({
+          errorMessage: run.errorMessage,
+          stopReason: run.stopReason,
+          exitCode: run.exitCode,
+          signal: run.signal,
+          stderr,
+          lastToolCall: run.lastToolCall,
+          usageLine: run.usage.turns > 0 ? usageStr : undefined,
+          finalText: output,
+        });
+        content = `## Subagent \`${id}\` failed (${elapsed})\n\n${body}`;
       } else {
         content = `## Subagent \`${id}\` completed (${elapsed}, ${usageStr})\n\n${output}`;
       }
@@ -340,8 +351,9 @@ export default function (pi: ExtensionAPI) {
       stderr += data.toString();
     });
 
-    proc.on("close", (code) => {
+    proc.on("close", (code, signal) => {
       // finishRun is idempotent — may have already been called via agent_end
+      if (signal) run.signal = signal;
       finishRun(code ?? 0);
     });
 
